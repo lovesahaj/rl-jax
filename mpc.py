@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from gymnasium import spaces
 
+from scipy.linalg import solve_continuous_are, solve_discrete_are
+
 import jax
 import jax.numpy as jnp
 import jax.random as jran
@@ -17,7 +19,7 @@ def dprint(x: Any, name: str):
 
 
 MAX_ITER = 100
-MAX_MPC_STEPS = 500
+MAX_MPC_STEPS = 1000 
 TOLERANCE = 1e-4
 LAMBDA = 1e-2
 ALPHAS = [1.0, 0.5, 0.25, 0.1, 0.05, 0.01]
@@ -37,25 +39,33 @@ LENGTH = 0.5
 POLEMASS_LENGTH = MASSPOLE * LENGTH
 
 # iLQR parameters
-Q = jnp.diag(jnp.array([1, 0.1, 10, 0.1], dtype=jnp.float32))
-Q_F = Q.copy() * 10
-R = jnp.diag(jnp.array([1.0], dtype=jnp.float32))
+Q = jnp.diag(jnp.array([1, 0.1, 100, 10], dtype=jnp.float32))
+R = jnp.diag(jnp.array([0.01], dtype=jnp.float32))
 X_GOAL = jnp.zeros(STATE_DIM, dtype=jnp.float32)
 
+# Equilibrium
+x_eq = jnp.zeros(STATE_DIM, dtype=jnp.float32)
+u_eq = jnp.zeros(ACTION_DIM, dtype=jnp.float32)
+
 # Horizon
-T = 100
+T = 150
 DT = 0.02
 
 
 def _check_if_terminated(state: jtype.Array) -> bool:
     x, _, theta, _ = state
 
-    return bool(
+    terminated = bool(
         x < -TERMINAL_POS
         or x > TERMINAL_POS
         or theta < -TERMINAL_ANGLE
         or theta > TERMINAL_ANGLE
     )
+
+    if terminated:
+        print(state)
+
+    return terminated
 
 
 @jax.jit
@@ -85,6 +95,9 @@ def dynamics(x: jtype.Array, u: jtype.Array):
 A_fn = jax.jacfwd(dynamics, argnums=0)
 B_fn = jax.jacfwd(dynamics, argnums=1)
 
+A_inf = A_fn(x_eq, u_eq)
+B_inf = B_fn(x_eq, u_eq)
+P = jnp.array(solve_discrete_are(A_inf, B_inf, Q, R))
 
 @jax.jit
 def l(x: jtype.Array, u: jtype.Array) -> jtype.Float:
@@ -103,7 +116,7 @@ lux_fn = jax.jacfwd(jax.grad(l, argnums=1), argnums=0)
 @jax.jit
 def lf(x):
     diff = x - X_GOAL
-    return diff.T @ Q_F @ diff
+    return diff.T @ P @ diff
 
 
 Vx_fn = jax.grad(lf)
@@ -352,36 +365,36 @@ def derivatives(X, U):
     return A, B, lx, lu, lxx, luu, lux, Vx, Vxx
 
 
-# def backward_pass(A, B, lx, lu, lxx, luu, lux, Vx, Vxx):
-#     k_list = []
-#     K_list = []
-#
-#     for t in reversed(range(T)):
-#         At = A[t]
-#         Bt = B[t]
-#
-#         Qx = lx[t] + At.T @ Vx
-#         Qu = lu[t] + Bt.T @ Vx
-#
-#         Qxx = lxx[t] + At.T @ Vxx @ At
-#         Quu = luu[t] + Bt.T @ Vxx @ Bt
-#         Qux = lux[t] + Bt.T @ Vxx @ At
-#
-#         Quu = Quu + LAMBDA * jnp.eye(1)
-#
-#         kt = -jnp.linalg.solve(Quu, Qu)
-#         Kt = -jnp.linalg.solve(Quu, Qux)
-#
-#         Vx = Qx + Kt.T @ Quu @ kt + Kt.T @ Qu + Qux.T @ kt
-#         Vxx = Qxx + Kt.T @ Quu @ Kt + Kt.T @ Qux + Qux.T @ Kt
-#
-#         k_list.append(kt)
-#         K_list.append(Kt)
-#
-#     k = jnp.stack(k_list[::-1])
-#     K = jnp.stack(K_list[::-1])
-#
-#     return k, K
+def backward_pass_python(A, B, lx, lu, lxx, luu, lux, Vx, Vxx):
+    k_list = []
+    K_list = []
+
+    for t in reversed(range(T)):
+        At = A[t]
+        Bt = B[t]
+
+        Qx = lx[t] + At.T @ Vx
+        Qu = lu[t] + Bt.T @ Vx
+
+        Qxx = lxx[t] + At.T @ Vxx @ At
+        Quu = luu[t] + Bt.T @ Vxx @ Bt
+        Qux = lux[t] + Bt.T @ Vxx @ At
+
+        Quu = Quu + LAMBDA * jnp.eye(1)
+
+        kt = -jnp.linalg.solve(Quu, Qu)
+        Kt = -jnp.linalg.solve(Quu, Qux)
+
+        Vx = Qx + Kt.T @ Quu @ kt + Kt.T @ Qu + Qux.T @ kt
+        Vxx = Qxx + Kt.T @ Quu @ Kt + Kt.T @ Qux + Qux.T @ Kt
+
+        k_list.append(kt)
+        K_list.append(Kt)
+
+    k = jnp.stack(k_list[::-1])
+    K = jnp.stack(K_list[::-1])
+
+    return k, K
 
 
 @jax.jit
@@ -407,6 +420,7 @@ def backward_pass(A, B, lx, lu, lxx, luu, lux, Vx, Vxx):
 
         Vx = Qx + Kt.T @ Quu @ kt + Kt.T @ Qu + Qux.T @ kt
         Vxx = Qxx + Kt.T @ Quu @ Kt + Kt.T @ Qux + Qux.T @ Kt
+        Vxx = 0.5 * (Vxx + Vxx.T)
 
         return (Vx, Vxx), (kt, Kt)
 
@@ -478,11 +492,29 @@ def main():
         x0, reward, terminated, truncated, info = env.step(U[0])
         env.render()
 
-        U = jnp.concatenate((U[1:], U[-1:]), axis=0)
+        # U = jnp.concatenate((U[1:], U[-1:]), axis=0)
+        U = jnp.concatenate((U[1:], jnp.zeros_like(U[-1:])), axis=0)
 
         if terminated or truncated:
             break
 
+
+def test():
+    env = ProjectEnv(render_mode="human")
+    x0, info = env.reset()
+    U = jnp.zeros((T, *(ACTION_DIM)))
+    X, U, loss = rollout(x0, U)
+
+    A, B, lx, lu, lxx, luu, lux, Vx, Vxx = derivatives(X, U)
+    k_py, K_py = backward_pass_python(A, B, lx, lu, lxx, luu, lux, Vx, Vxx)
+    k_jit, K_jit = backward_pass(A, B, lx, lu, lxx, luu, lux, Vx, Vxx)
+
+    print(jnp.max(jnp.abs(k_py - k_jit)))
+    print(jnp.max(jnp.abs(K_py - K_jit)))
+
+    x = jnp.array([0.0, 0.0, 0.1, 0.0])
+    print(f"{dynamics(x, jnp.array([10.0])) = }")
+    print(f"{dynamics(x, jnp.array([-10.0])) = }")
 
 if __name__ == "__main__":
     main()
