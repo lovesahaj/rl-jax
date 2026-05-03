@@ -1,4 +1,5 @@
 import math
+import os
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
@@ -9,6 +10,8 @@ from tqdm import tqdm
 
 import jax.numpy as jnp
 import jax.random as jran
+
+OUTPUT_DIR = "output"
 
 NUM_STATES = 4
 NUM_ACTIONS = 2
@@ -322,56 +325,141 @@ class ProjectEnv(gym.Env):
         )
 
 
+def moving_average(x, window=50):
+    x = np.asarray(x, dtype=np.float32)
+
+    if len(x) < window:
+        return x
+
+    return np.convolve(x, np.ones(window) / window, mode="valid")
+
+
+def plot_training(rewards, window=50, save_dir=OUTPUT_DIR):
+    os.makedirs(save_dir, exist_ok=True)
+    rewards = np.asarray(rewards, dtype=np.float32)
+    costs = -rewards
+
+    reward_ma = moving_average(rewards, window)
+    cost_ma = moving_average(costs, window)
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(costs, alpha=0.35, label="Episode cost")
+    plt.plot(
+        np.arange(window - 1, window - 1 + len(cost_ma)),
+        cost_ma,
+        linewidth=2,
+        label=f"{window}-episode moving average",
+    )
+    plt.xlabel("Episode")
+    plt.ylabel("Cost / Loss")
+    plt.title("Q-learning Training Cost")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(save_dir, "q_learning_cost.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(rewards, alpha=0.35, label="Episode reward")
+    plt.plot(
+        np.arange(window - 1, window - 1 + len(reward_ma)),
+        reward_ma,
+        linewidth=2,
+        label=f"{window}-episode moving average",
+    )
+    plt.xlabel("Episode")
+    plt.ylabel("Reward")
+    plt.title("Q-learning Training Reward")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(save_dir, "q_learning_reward.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+
+
 def train(num_episodes=2000):
     env = ProjectEnv()
     episode_rewards = []
 
     loop = tqdm(range(num_episodes))
+
     for ep in loop:
         env.reset()
-        total_reward = 0
+        total_reward = 0.0
 
         for _ in range(500):
             action = int(env.choose_action())
+
             cur_state = env.state
             obs, reward, terminated, truncated, info = env.step(action)
             next_state = env.state
-            env.q_update(cur_state, next_state, action, reward, terminated)
-            total_reward += reward
+
+            env.q_update(
+                cur_state,
+                next_state,
+                action,
+                reward,
+                terminated,
+            )
+
+            total_reward += float(reward)
 
             if terminated or truncated:
                 break
 
         episode_rewards.append(total_reward)
-        loop.set_postfix({"Reward": total_reward})
+
+        loop.set_postfix(
+            {
+                "Reward": round(total_reward, 3),
+                "Cost": round(-total_reward, 3),
+                "Epsilon": round(env.epsilon, 3),
+            }
+        )
+
         env.update_epsilon()
 
     return episode_rewards, env
 
 
-def test(env):
-    env.render_mode = "human"
+def test(env, num_episodes=50):
+    env.render_mode = "console"
     episode_rewards = []
 
-    for ep in range(50):
+    old_epsilon = env.epsilon
+    env.epsilon = 0.0
+
+    for ep in range(num_episodes):
         env.reset()
-        total_reward = 0
+        total_reward = 0.0
 
         for _ in range(500):
             action = int(env.choose_action())
+
             obs, reward, terminated, truncated, info = env.step(action)
-            total_reward += reward
+
+            total_reward += float(reward)
             env.render()
 
             if terminated or truncated:
                 break
 
         episode_rewards.append(total_reward)
-        env.update_epsilon()
+
+    env.epsilon = old_epsilon
 
     return episode_rewards
 
 
 if __name__ == "__main__":
-    rewards, env = train()
-    test(env)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    rewards, env = train(num_episodes=2000)
+
+    plot_training(rewards, window=50)
+
+    test_rewards = test(env, num_episodes=50)
+
+    np.savez(
+        os.path.join(OUTPUT_DIR, "q_learning_results.npz"),
+        train_rewards=np.array(rewards),
+        test_rewards=np.array(test_rewards),
+    )
+    print(f"Results saved to {OUTPUT_DIR}/")

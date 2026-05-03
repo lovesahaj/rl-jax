@@ -1,8 +1,10 @@
 import math
+import os
 from typing import Any
 
 import gymnasium as gym
 import jaxtyping as jtype
+import matplotlib.pyplot as plt
 import numpy as np
 from gymnasium import spaces
 from scipy.linalg import solve_discrete_are
@@ -10,6 +12,8 @@ from scipy.linalg import solve_discrete_are
 import jax
 import jax.numpy as jnp
 import jax.random as jran
+
+OUTPUT_DIR = "output"
 
 
 def dprint(x: Any, name: str):
@@ -460,9 +464,14 @@ def forward_pass(x0, U, X, k, K, alpha):
 
 
 def main():
-    env = ProjectEnv(render_mode="human")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    env = ProjectEnv(render_mode="console")
     x0, info = env.reset()
     U = jnp.zeros((T, *(ACTION_DIM)))
+
+    state_history = []
+    action_history = []
+    step_loss_history = []
 
     for mpc_step in range(MAX_MPC_STEPS):
         for i in range(MAX_ITER):
@@ -488,6 +497,10 @@ def main():
             if not accepted:
                 break
 
+        state_history.append(np.array(x0))
+        action_history.append(np.array(U[0]))
+        step_loss_history.append(float(loss))
+
         x0, reward, terminated, truncated, info = env.step(U[0])
         env.render()
 
@@ -497,9 +510,57 @@ def main():
         if terminated or truncated:
             break
 
+    env.close()
+
+    state_history = np.array(state_history)
+    action_history = np.array(action_history)
+    step_loss_history = np.array(step_loss_history)
+
+    np.savez(
+        os.path.join(OUTPUT_DIR, "mpc_results.npz"),
+        state_history=state_history,
+        action_history=action_history,
+        step_loss_history=step_loss_history,
+    )
+
+    time = np.arange(len(state_history)) * DT
+
+    plt.figure()
+    plt.plot(step_loss_history)
+    plt.xlabel("MPC Step")
+    plt.ylabel("Loss")
+    plt.title("MPC Loss per Step")
+    plt.grid()
+    plt.savefig(os.path.join(OUTPUT_DIR, "mpc_loss.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+
+    labels = ["Cart position [m]", "Cart velocity [m/s]", "Pole angle [rad]", "Angular velocity [rad/s]"]
+    fnames = ["mpc_cart_position.png", "mpc_cart_velocity.png", "mpc_pole_angle.png", "mpc_angular_velocity.png"]
+
+    for i, (label, fname) in enumerate(zip(labels, fnames)):
+        plt.figure()
+        plt.plot(time, state_history[:, i])
+        plt.xlabel("Time [s]")
+        plt.ylabel(label)
+        plt.title(label)
+        plt.grid()
+        plt.savefig(os.path.join(OUTPUT_DIR, fname), dpi=150, bbox_inches="tight")
+        plt.close()
+
+    plt.figure()
+    plt.plot(time, action_history[:, 0])
+    plt.xlabel("Time [s]")
+    plt.ylabel("Force [N]")
+    plt.title("MPC Control Force")
+    plt.grid()
+    plt.savefig(os.path.join(OUTPUT_DIR, "mpc_force.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+
+    print(f"Results saved to {OUTPUT_DIR}/")
+
 
 def test():
-    env = ProjectEnv(render_mode="human")
+    env = ProjectEnv(render_mode="console")
     x0, info = env.reset()
     U = jnp.zeros((T, *(ACTION_DIM)))
     X, U, loss = rollout(x0, U)

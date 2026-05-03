@@ -1,14 +1,18 @@
 import math
+import os
 from typing import Any
 
 import gymnasium as gym
 import jaxtyping as jtype
+import matplotlib.pyplot as plt
 import numpy as np
 from gymnasium import spaces
 
 import jax
 import jax.numpy as jnp
 import jax.random as jran
+
+OUTPUT_DIR = "output"
 
 
 def dprint(x: Any, name: str):
@@ -445,10 +449,13 @@ def forward_pass(x0, U, X, k, K, alpha):
 
 
 def main():
-    env = ProjectEnv(render_mode="human")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    env = ProjectEnv(render_mode="console")
     x0, info = env.reset()
     U = jnp.zeros((T, *(ACTION_DIM)))
     X, U, loss = rollout(env.state, U)
+
+    loss_history = []
 
     for i in range(MAX_ITER):
         A, B, lx, lu, lxx, luu, lux, Vx, Vxx = derivatives(X, U)
@@ -466,17 +473,71 @@ def main():
                 accepted = True
                 break
 
+        loss_history.append(float(loss))
         print(i, float(loss), accepted)
 
         if not accepted:
             break
 
+    state_history = []
+    action_history = []
+
     for t in range(T):
+        state_history.append(np.array(env.state))
+        action_history.append(np.array(U[t]))
         obs, reward, terminated, truncated, info = env.step(U[t])
         env.render()
 
         if terminated or truncated:
             break
+
+    env.close()
+
+    state_history = np.array(state_history)
+    action_history = np.array(action_history)
+    loss_history = np.array(loss_history)
+
+    np.savez(
+        os.path.join(OUTPUT_DIR, "ilqr_results.npz"),
+        state_history=state_history,
+        action_history=action_history,
+        loss_history=loss_history,
+    )
+
+    time = np.arange(len(state_history)) * DT
+
+    plt.figure()
+    plt.plot(loss_history)
+    plt.xlabel("Iteration")
+    plt.ylabel("Loss")
+    plt.title("iLQR Optimization Loss")
+    plt.grid()
+    plt.savefig(os.path.join(OUTPUT_DIR, "ilqr_loss.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+
+    labels = ["Cart position [m]", "Cart velocity [m/s]", "Pole angle [rad]", "Angular velocity [rad/s]"]
+    fnames = ["ilqr_cart_position.png", "ilqr_cart_velocity.png", "ilqr_pole_angle.png", "ilqr_angular_velocity.png"]
+
+    for i, (label, fname) in enumerate(zip(labels, fnames)):
+        plt.figure()
+        plt.plot(time, state_history[:, i])
+        plt.xlabel("Time [s]")
+        plt.ylabel(label)
+        plt.title(label)
+        plt.grid()
+        plt.savefig(os.path.join(OUTPUT_DIR, fname), dpi=150, bbox_inches="tight")
+        plt.close()
+
+    plt.figure()
+    plt.plot(time, action_history[:, 0])
+    plt.xlabel("Time [s]")
+    plt.ylabel("Force [N]")
+    plt.title("iLQR Control Force")
+    plt.grid()
+    plt.savefig(os.path.join(OUTPUT_DIR, "ilqr_force.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+
+    print(f"Results saved to {OUTPUT_DIR}/")
 
 
 if __name__ == "__main__":

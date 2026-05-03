@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from gymnasium import spaces
 from scipy.linalg import solve_continuous_are
+from tqdm import tqdm
 
 import jax.numpy as jnp
 import jax.random as jran
@@ -14,6 +15,30 @@ OUTPUT_DIR = "output"
 
 NUM_STATES = 4
 NUM_ACTIONS = 2
+NUM_BINS = 10
+
+ALPHA = 0.1
+GAMMA = 0.99
+
+# Define bin edges for each state variable
+# Using linspace: the *internal* edges only (no need for outer bounds)
+STATE_BINS = [
+    jnp.linspace(-2.4, 2.4, NUM_BINS - 1),  # x (cart position)
+    jnp.linspace(-3.0, 3.0, NUM_BINS - 1),  # x_dot (cart velocity)
+    jnp.linspace(-0.21, 0.21, NUM_BINS - 1),  # theta (pole angle)
+    jnp.linspace(-3.0, 3.0, NUM_BINS - 1),  # theta_dot (angular velocity)
+]
+
+
+def make_key(state) -> tuple:
+    # Convert JAX array to numpy so np.digitize works
+    state = np.array(state)
+
+    key = tuple(
+        int(jnp.clip(jnp.digitize(s, bins), 0, NUM_BINS - 1))
+        for s, bins in zip(state, STATE_BINS)
+    )
+    return key
 
 
 class ProjectEnv(gym.Env):
@@ -57,41 +82,28 @@ class ProjectEnv(gym.Env):
         self.clock = None
         self.isopen = True
 
-        # LQR
-        self.A = jnp.array(
-            [
-                [0, 1, 0, 0],
-                [0, 0, -(self.masspole * self.gravity) / self.masscart, 0],
-                [0, 0, 0, 1],
-                [
-                    0,
-                    0,
-                    ((self.masscart + self.masspole) * self.gravity)
-                    / (self.length * self.masscart),
-                    0,
-                ],
-            ],
+        # Q Table
+        self.q_table = jnp.zeros(
+            [NUM_BINS] * NUM_STATES + [NUM_ACTIONS],
+            dtype=jnp.float32,
         )
+        self.epsilon = 1.0
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.995
 
-        B = jnp.array([0, 1 / self.masscart, 0, -1 / (self.length * self.masscart)])
-        self.B = B[:, None]
-
-        self.Q = jnp.diag(jnp.array([1, 1, 100, 10], dtype=jnp.float32))
-        self.R = jnp.array([[1]], dtype=jnp.float32)
-
-        self.P = solve_continuous_are(self.A, self.B, self.Q, self.R)
-        self.K = jnp.linalg.solve(self.R, self.B.T @ self.P)
+    def update_epsilon(self):
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-
         if seed is not None:
             self.key = jran.key(seed)
 
-        self.state = jnp.array([0, 0.0, 0.1, 1], dtype=jnp.float32)
-
-        info = {}
-        return self.state, info
+        self.key, subkey = jran.split(self.key)
+        self.state = jran.uniform(
+            subkey, shape=(NUM_STATES,), minval=-0.05, maxval=0.05
+        )
+        return self.state, {}
 
     def step(self, action):
         # assert self.action_space.contains(action), f"Invalid action: {action}"
@@ -101,11 +113,16 @@ class ProjectEnv(gym.Env):
         terminated = self._check_if_terminated(self.state)
         truncated = False
 
-        reward = 0.0 if terminated else 1.0
+        cost = -100.0 if terminated else -self.cost()
 
         info = {"current_state": "stopped" if terminated or truncated else "moving"}
 
-        return self.state, reward, terminated, truncated, info
+        return self.state, cost, terminated, truncated, info
+
+    def cost(self):
+        x, x_dot, theta, theta_dot = self.state
+
+        return 0.01 * abs(x) + 0.1 * (x**2) + 1 * (theta**2) + 0.1 * abs(theta_dot)
 
     def render(self):
         if self.render_mode == "console":
@@ -264,115 +281,191 @@ class ProjectEnv(gym.Env):
             self.clock = None
             self.isopen = False
 
-    def choose_action(self):
-        state = self.state
-        F = -self.K @ state
-        F_scalar = float(F.item())
+    def choose_action(self, state):
+        """
+        need to implement the epsilon greedy
 
-        return 1 if F_scalar > 0 else 0
+        A = [
+            1 - epsilon + epsilon / |action_space|, if action == max_action
+            epsilon / |action_space| otherwise
+        ]
+        """
+
+        probs = jnp.ones(NUM_ACTIONS, dtype=jnp.float32)
+        actions = self.q_table[*make_key(state), :]
+
+        max_action_idx = int(jnp.argmax(actions))
+        probs = probs * (self.epsilon / NUM_ACTIONS)
+        probs = probs.at[max_action_idx].set(
+            1 - self.epsilon + (self.epsilon / NUM_ACTIONS)
+        )
+        self.key, subkey = jran.split(self.key)
+
+        return jran.choice(
+            subkey,
+            jnp.arange(0, NUM_ACTIONS),
+            p=probs,
+        )
+
+    def q_update(self, cur_state, next_state, action, next_action, reward, terminated):
+        """
+
+        Q(s, a) <- Q(s, a) + ALPHA * (r + GAMMA * max_a' Q(s', a') - Q(s, a))
+        """
+        cur_key = make_key(cur_state)
+        next_key = make_key(next_state)
+
+        current_q = self.q_table[*cur_key, action]
+        if terminated:
+            target_q = reward
+        else:
+            target_q = reward + GAMMA * self.q_table[*next_key, next_action]
+
+        self.q_table = self.q_table.at[*cur_key, action].set(
+            current_q + ALPHA * (target_q - current_q)
+        )
 
 
-def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    env = ProjectEnv(render_mode="console")
-    obs, info = env.reset()
+def moving_average(x, window=50):
+    x = np.asarray(x, dtype=np.float32)
 
-    state_history = []
-    force_history = []
-    action_history = []
-    reward_history = []
+    if len(x) < window:
+        return x
 
-    for _ in range(500):
-        state_history.append(env.state)
-        F_scalar = env.choose_action()
-        action = 1 if F_scalar > 0 else 0
-        force_history.append(F_scalar)
-        action_history.append(action)
+    return np.convolve(x, np.ones(window) / window, mode="valid")
 
-        obs, reward, terminated, truncated, info = env.step(action)
-        reward_history.append(reward)
 
-        env.render()
+def plot_training(rewards, window=50, save_dir=OUTPUT_DIR):
+    os.makedirs(save_dir, exist_ok=True)
+    rewards = np.asarray(rewards, dtype=np.float32)
+    costs = -rewards
 
-        if terminated or truncated:
-            break
+    reward_ma = moving_average(rewards, window)
+    cost_ma = moving_average(costs, window)
 
-    env.close()
-
-    state_history = np.array(state_history)
-    force_history = np.array(force_history)
-    action_history = np.array(action_history)
-    reward_history = np.array(reward_history)
-
-    np.savez(
-        os.path.join(OUTPUT_DIR, "lqr_results.npz"),
-        state_history=state_history,
-        force_history=force_history,
-        action_history=action_history,
-        reward_history=reward_history,
+    plt.figure(figsize=(10, 5))
+    plt.plot(costs, alpha=0.35, label="Episode cost")
+    plt.plot(
+        np.arange(window - 1, window - 1 + len(cost_ma)),
+        cost_ma,
+        linewidth=2,
+        label=f"{window}-episode moving average",
     )
 
-    time = np.arange(len(state_history)) * env.tau
-
-    plt.figure()
-    plt.plot(time, state_history[:, 0])
-    plt.xlabel("Time [s]")
-    plt.ylabel("Cart position x [m]")
-    plt.title("Cart Position")
-    plt.grid()
-    plt.savefig(os.path.join(OUTPUT_DIR, "lqr_cart_position.png"), dpi=150, bbox_inches="tight")
+    plt.xlabel("Episode")
+    plt.ylabel("Cost")
+    plt.title("SARSA Training Cost")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(save_dir, "sarsa_cost.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
-    plt.figure()
-    plt.plot(time, state_history[:, 1])
-    plt.xlabel("Time [s]")
-    plt.ylabel("Cart velocity x_dot [m/s]")
-    plt.title("Cart Velocity")
-    plt.grid()
-    plt.savefig(os.path.join(OUTPUT_DIR, "lqr_cart_velocity.png"), dpi=150, bbox_inches="tight")
+    plt.figure(figsize=(10, 5))
+    plt.plot(rewards, alpha=0.35, label="Episode reward")
+    plt.plot(
+        np.arange(window - 1, window - 1 + len(reward_ma)),
+        reward_ma,
+        linewidth=2,
+        label=f"{window}-episode moving average",
+    )
+
+    plt.xlabel("Episode")
+    plt.ylabel("Reward")
+    plt.title("SARSA Training Reward")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(save_dir, "sarsa_reward.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
-    plt.figure()
-    plt.plot(time, state_history[:, 2])
-    plt.axhline(float(env.terminal_angle), linestyle="--")
-    plt.axhline(float(-env.terminal_angle), linestyle="--")
-    plt.xlabel("Time [s]")
-    plt.ylabel("Pole angle theta [rad]")
-    plt.title("Pole Angle")
-    plt.grid()
-    plt.savefig(os.path.join(OUTPUT_DIR, "lqr_pole_angle.png"), dpi=150, bbox_inches="tight")
-    plt.close()
 
-    plt.figure()
-    plt.plot(time, state_history[:, 3])
-    plt.xlabel("Time [s]")
-    plt.ylabel("Angular velocity theta_dot [rad/s]")
-    plt.title("Pole Angular Velocity")
-    plt.grid()
-    plt.savefig(os.path.join(OUTPUT_DIR, "lqr_angular_velocity.png"), dpi=150, bbox_inches="tight")
-    plt.close()
+def train(num_episodes=2000):
+    env = ProjectEnv()
+    episode_rewards = []
 
-    plt.figure()
-    plt.plot(time, force_history)
-    plt.xlabel("Time [s]")
-    plt.ylabel("LQR force F")
-    plt.title("Raw LQR Force")
-    plt.grid()
-    plt.savefig(os.path.join(OUTPUT_DIR, "lqr_force.png"), dpi=150, bbox_inches="tight")
-    plt.close()
+    loop = tqdm(range(num_episodes))
 
-    plt.figure()
-    plt.step(time, action_history, where="post")
-    plt.xlabel("Time [s]")
-    plt.ylabel("Discrete action")
-    plt.title("Discrete Action Chosen from LQR Force")
-    plt.yticks([0, 1], ["left", "right"])
-    plt.grid()
-    plt.savefig(os.path.join(OUTPUT_DIR, "lqr_actions.png"), dpi=150, bbox_inches="tight")
-    plt.close()
+    for ep in loop:
+        state, _ = env.reset()
+        total_reward = 0.0
+        action = int(env.choose_action(state))
 
-    print(f"Results saved to {OUTPUT_DIR}/")
+        for _ in range(500):
+            next_state, reward, terminated, truncated, _ = env.step(action)
+
+            next_action = int(env.choose_action(next_state))
+
+            env.q_update(
+                state,
+                next_state,
+                action,
+                next_action,
+                reward,
+                terminated,
+            )
+
+            total_reward += float(reward)
+
+            if terminated or truncated:
+                break
+
+            state = next_state
+            action = next_action
+
+        episode_rewards.append(total_reward)
+
+        loop.set_postfix(
+            {
+                "Reward": round(total_reward, 3),
+                "Cost": round(-total_reward, 3),
+                "Epsilon": round(env.epsilon, 3),
+            }
+        )
+
+        env.update_epsilon()
+
+    return episode_rewards, env
+
+
+def test(env):
+    env.render_mode = "console"
+    episode_rewards = []
+
+    old_epsilon = env.epsilon
+    env.epsilon = 0.0  # greedy evaluation
+
+    for ep in range(50):
+        state, _ = env.reset()
+        total_reward = 0.0
+
+        for _ in range(500):
+            action = int(env.choose_action(state))
+            next_state, reward, terminated, truncated, _ = env.step(action)
+
+            total_reward += float(reward)
+            env.render()
+
+            if terminated or truncated:
+                break
+
+            state = next_state
+
+        episode_rewards.append(total_reward)
+
+    env.epsilon = old_epsilon
+    return episode_rewards
 
 
 if __name__ == "__main__":
-    main()
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    rewards, env = train(num_episodes=2000)
+
+    plot_training(rewards, window=50)
+
+    test_rewards = test(env)
+
+    np.savez(
+        os.path.join(OUTPUT_DIR, "sarsa_results.npz"),
+        train_rewards=np.array(rewards),
+        test_rewards=np.array(test_rewards),
+    )
+    print(f"Results saved to {OUTPUT_DIR}/")
