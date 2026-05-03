@@ -3,7 +3,6 @@ from typing import Any
 
 import gymnasium as gym
 import jaxtyping as jtype
-import matplotlib.pyplot as plt
 import numpy as np
 from gymnasium import spaces
 
@@ -42,7 +41,7 @@ R = jnp.diag(jnp.array([1.0], dtype=jnp.float32))
 X_GOAL = jnp.zeros(STATE_DIM, dtype=jnp.float32)
 
 # Horizon
-T = 200 
+T = 200
 DT = 0.02
 
 
@@ -478,7 +477,6 @@ def main():
 
         if terminated or truncated:
             break
-
 
 
 if __name__ == "__main__":

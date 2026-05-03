@@ -3,11 +3,9 @@ from typing import Any
 
 import gymnasium as gym
 import jaxtyping as jtype
-import matplotlib.pyplot as plt
 import numpy as np
 from gymnasium import spaces
-
-from scipy.linalg import solve_continuous_are, solve_discrete_are
+from scipy.linalg import solve_discrete_are
 
 import jax
 import jax.numpy as jnp
@@ -19,7 +17,7 @@ def dprint(x: Any, name: str):
 
 
 MAX_ITER = 100
-MAX_MPC_STEPS = 1000 
+MAX_MPC_STEPS = 1000
 TOLERANCE = 1e-4
 LAMBDA = 1e-2
 ALPHAS = [1.0, 0.5, 0.25, 0.1, 0.05, 0.01]
@@ -98,6 +96,7 @@ B_fn = jax.jacfwd(dynamics, argnums=1)
 A_inf = A_fn(x_eq, u_eq)
 B_inf = B_fn(x_eq, u_eq)
 P = jnp.array(solve_discrete_are(A_inf, B_inf, Q, R))
+
 
 @jax.jit
 def l(x: jtype.Array, u: jtype.Array) -> jtype.Float:
@@ -515,6 +514,7 @@ def test():
     x = jnp.array([0.0, 0.0, 0.1, 0.0])
     print(f"{dynamics(x, jnp.array([10.0])) = }")
     print(f"{dynamics(x, jnp.array([-10.0])) = }")
+
 
 if __name__ == "__main__":
     main()
