@@ -1,1 +1,26 @@
-.idea
+# IDE
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+
+# Build / packaging
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# Weights & Biases
+wandb/
+
+# Output (generated files)
+output/
