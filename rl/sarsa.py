@@ -1,6 +1,5 @@
 import os
 
-import matplotlib.pyplot as plt
 import numpy as np
 from gymnasium import spaces
 from tqdm import tqdm
@@ -8,6 +7,7 @@ from tqdm import tqdm
 import jax.numpy as jnp
 import jax.random as jran
 
+from bench import BENCH_Q, BENCH_R, evaluate, save_results, with_canonical_reward
 from env.cartpole import CartPoleEnv, NUM_STATES, NUM_ACTIONS
 
 OUTPUT_DIR = "output"
@@ -90,54 +90,6 @@ class ProjectEnv(CartPoleEnv):
         )
 
 
-def moving_average(x, window=50):
-    x = np.asarray(x, dtype=np.float32)
-    if len(x) < window:
-        return x
-    return np.convolve(x, np.ones(window) / window, mode="valid")
-
-
-def plot_training(rewards, window=50, save_dir=OUTPUT_DIR):
-    os.makedirs(save_dir, exist_ok=True)
-    rewards = np.asarray(rewards, dtype=np.float32)
-    costs = -rewards
-
-    reward_ma = moving_average(rewards, window)
-    cost_ma = moving_average(costs, window)
-
-    plt.figure(figsize=(10, 5))
-    plt.plot(costs, alpha=0.35, label="Episode cost")
-    plt.plot(
-        np.arange(window - 1, window - 1 + len(cost_ma)),
-        cost_ma,
-        linewidth=2,
-        label=f"{window}-episode moving average",
-    )
-    plt.xlabel("Episode")
-    plt.ylabel("Cost")
-    plt.title("SARSA Training Cost")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(os.path.join(save_dir, "sarsa_cost.png"), dpi=150, bbox_inches="tight")
-    plt.close()
-
-    plt.figure(figsize=(10, 5))
-    plt.plot(rewards, alpha=0.35, label="Episode reward")
-    plt.plot(
-        np.arange(window - 1, window - 1 + len(reward_ma)),
-        reward_ma,
-        linewidth=2,
-        label=f"{window}-episode moving average",
-    )
-    plt.xlabel("Episode")
-    plt.ylabel("Reward")
-    plt.title("SARSA Training Reward")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(os.path.join(save_dir, "sarsa_reward.png"), dpi=150, bbox_inches="tight")
-    plt.close()
-
-
 def train(num_episodes=2000):
     env = ProjectEnv()
     episode_rewards = []
@@ -175,44 +127,42 @@ def train(num_episodes=2000):
     return episode_rewards, env
 
 
-def test(env):
-    env.render_mode = "console"
-    episode_rewards = []
-    old_epsilon = env.epsilon
-    env.epsilon = 0.0
+def benchmark(trained_env, train_rewards=None, num_episodes=100, max_steps=500):
+    """Evaluate the greedy policy of a trained SARSA agent."""
+    q_table = trained_env.q_table
 
-    for ep in range(50):
-        state, _ = env.reset()
-        total_reward = 0.0
+    def env_factory(seed):
+        e = ProjectEnv(seed=seed)
+        e.q_table = q_table
+        e.epsilon = 0.0
+        return with_canonical_reward(e)
 
-        for _ in range(500):
-            action = int(env.choose_action(state))
-            next_state, reward, terminated, truncated, _ = env.step(action)
-            total_reward += float(reward)
-            env.render()
+    summary = evaluate(
+        name="SARSA",
+        env_factory=env_factory,
+        policy_factory=lambda env: (lambda e: int(e.choose_action(e.state))),
+        num_episodes=num_episodes,
+        max_steps=max_steps,
+        Q=BENCH_Q,
+        R=BENCH_R,
+        balanced_threshold=max_steps,
+    )
 
-            if terminated or truncated:
-                break
+    if train_rewards is not None and train_rewards.size:
+        ma = np.convolve(train_rewards, np.ones(50) / 50, mode="valid") if train_rewards.size >= 50 else train_rewards
+        threshold = 0.9 * np.max(ma)
+        idx = int(np.argmax(ma >= threshold))
+        summary["convergence_episode"] = float(idx + 50 if train_rewards.size >= 50 else idx)
+        summary["final_train_reward"] = float(np.mean(train_rewards[-50:]))
 
-            state = next_state
-
-        episode_rewards.append(total_reward)
-
-    env.epsilon = old_epsilon
-    return episode_rewards
+    save_results(os.path.join(OUTPUT_DIR, "sarsa_metrics.npz"), [summary])
+    print(f"SARSA benchmark saved to {OUTPUT_DIR}/sarsa_metrics.npz")
+    print(f"  stability_rate={summary.get('stability_rate', 0):.2%}  "
+          f"mean_test_reward={summary.get('total_reward_mean', 0):.2f}  "
+          f"mean_steps={summary.get('episode_length_mean', 0):.1f}")
 
 
 if __name__ == "__main__":
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     rewards, env = train(num_episodes=2000)
-
-    plot_training(rewards, window=50)
-
-    test_rewards = test(env)
-
-    np.savez(
-        os.path.join(OUTPUT_DIR, "sarsa_results.npz"),
-        train_rewards=np.array(rewards),
-        test_rewards=np.array(test_rewards),
-    )
-    print(f"Results saved to {OUTPUT_DIR}/")
+    benchmark(env, train_rewards=np.asarray(rewards, dtype=np.float64))

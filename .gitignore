@@ -22,5 +22,3 @@ build/
 # Weights & Biases
 wandb/
 
-# Output (generated files)
-output/

@@ -1,15 +1,24 @@
 import os
+import time
 
 import jaxtyping as jtype
-import matplotlib.pyplot as plt
 import numpy as np
 from gymnasium import spaces
 from scipy.linalg import solve_discrete_are
 
 import jax
 import jax.numpy as jnp
+import jax.random as jran
 
-from env.cartpole import CartPoleEnv, dynamics
+from bench import (
+    BENCH_Q,
+    BENCH_R,
+    aggregate,
+    compute_episode_metrics,
+    save_results,
+)
+from bench import rollout as bench_rollout
+from env.cartpole import NUM_STATES, CartPoleEnv, dynamics
 
 OUTPUT_DIR = "output"
 
@@ -69,7 +78,11 @@ class ProjectEnv(CartPoleEnv):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.state = jnp.array([0, 0.0, 0.1, 1], dtype=jnp.float32)
+        self.key, subkey = jran.split(self.key)
+        perturb = jran.uniform(
+            subkey, shape=(NUM_STATES,), minval=-0.05, maxval=0.05
+        )
+        self.state = jnp.array([0.0, 0.0, 0.1, 1.0], dtype=jnp.float32) + perturb
         return self.state, {}
 
     def _get_next_state(self, force):
@@ -191,109 +204,75 @@ def forward_pass(x0, U, X, k, K, alpha):
     return U_new, X_new, loss_new
 
 
-def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    env = ProjectEnv(render_mode="console")
-    x0, info = env.reset()
-    U = jnp.zeros((T, *(ACTION_DIM)))
+def _solve_step(x0, U):
+    """One MPC inner solve at the current state. Returns (U_opt, iters).
 
-    state_history = []
-    action_history = []
-    step_loss_history = []
-
-    for mpc_step in range(MAX_MPC_STEPS):
-        for i in range(MAX_ITER):
-            X, U, loss = rollout(x0, U)
-
-            A, B, lx, lu, lxx, luu, lux, Vx, Vxx = derivatives(X, U)
-            k, K = backward_pass(A, B, lx, lu, lxx, luu, lux, Vx, Vxx)
-
-            accepted = False
-
-            for alpha in ALPHAS:
-                U_new, X_new, loss_new = forward_pass(x0, U, X, k, K, alpha)
-
-                if loss_new < loss:
-                    X = X_new
-                    U = U_new
-                    loss = loss_new
-                    accepted = True
-                    break
-
-            print(i, float(loss), accepted)
-
-            if not accepted:
+    Stops on either: line-search rejection or relative loss change below
+    ``TOLERANCE``.
+    """
+    iters = 0
+    X, U, loss = rollout(x0, U)
+    for i in range(MAX_ITER):
+        prev_loss = float(loss)
+        A, B, lx, lu, lxx, luu, lux, Vx, Vxx = derivatives(X, U)
+        k, K = backward_pass(A, B, lx, lu, lxx, luu, lux, Vx, Vxx)
+        accepted = False
+        for alpha in ALPHAS:
+            U_new, X_new, loss_new = forward_pass(x0, U, X, k, K, alpha)
+            if loss_new < loss:
+                X, U, loss = X_new, U_new, loss_new
+                accepted = True
                 break
-
-        state_history.append(np.array(x0))
-        action_history.append(np.array(U[0]))
-        step_loss_history.append(float(loss))
-
-        x0, reward, terminated, truncated, info = env.step(U[0])
-        env.render()
-
-        U = jnp.concatenate((U[1:], jnp.zeros_like(U[-1:])), axis=0)
-
-        if terminated or truncated:
+        iters = i + 1
+        if not accepted:
             break
+        if abs(prev_loss - float(loss)) / max(1.0, abs(prev_loss)) < TOLERANCE:
+            break
+    return U, iters
 
-    env.close()
 
-    state_history = np.array(state_history)
-    action_history = np.array(action_history)
-    step_loss_history = np.array(step_loss_history)
+def benchmark():
+    Q_np = BENCH_Q
+    R_np = BENCH_R
+    per_episode = []
+    iters_log: list[float] = []
+    solve_times: list[float] = []
 
-    np.savez(
-        os.path.join(OUTPUT_DIR, "mpc_results.npz"),
-        state_history=state_history,
-        action_history=action_history,
-        step_loss_history=step_loss_history,
-    )
+    for seed in range(10):
+        env = ProjectEnv(seed=seed)
+        x0, _ = env.reset()
+        U_warm = [jnp.zeros((T, *(ACTION_DIM)))]
+        ep_iters: list[int] = []
+        ep_solve_t: list[float] = []
 
-    time = np.arange(len(state_history)) * DT
+        def policy(env, U_warm=U_warm, ep_iters=ep_iters, ep_solve_t=ep_solve_t):
+            t0 = time.perf_counter()
+            U_opt, iters = _solve_step(env.state, U_warm[0])
+            ep_solve_t.append(time.perf_counter() - t0)
+            ep_iters.append(iters)
+            u0 = U_opt[0]
+            U_warm[0] = jnp.concatenate((U_opt[1:], jnp.zeros_like(U_opt[-1:])), axis=0)
+            return jnp.asarray(u0, dtype=jnp.float32), float(u0[0])
 
-    plt.figure()
-    plt.plot(step_loss_history)
-    plt.xlabel("MPC Step")
-    plt.ylabel("Loss")
-    plt.title("MPC Loss per Step")
-    plt.grid()
-    plt.savefig(os.path.join(OUTPUT_DIR, "mpc_loss.png"), dpi=150, bbox_inches="tight")
-    plt.close()
+        stats = bench_rollout(env, policy, max_steps=MAX_MPC_STEPS)
+        per_episode.append(
+            compute_episode_metrics(stats, Q=Q_np, R=R_np, balanced_threshold=500)
+        )
+        iters_log.extend(ep_iters)
+        solve_times.extend(ep_solve_t)
+        env.close()
 
-    labels = [
-        "Cart position [m]",
-        "Cart velocity [m/s]",
-        "Pole angle [rad]",
-        "Angular velocity [rad/s]",
-    ]
-    fnames = [
-        "mpc_cart_position.png",
-        "mpc_cart_velocity.png",
-        "mpc_pole_angle.png",
-        "mpc_angular_velocity.png",
-    ]
+    summary = aggregate(per_episode, name="MPC")
+    summary["convergence_iters_mean"] = float(np.mean(iters_log)) if iters_log else 0.0
+    summary["convergence_iters_std"] = float(np.std(iters_log)) if iters_log else 0.0
+    summary["solve_mean_s"] = float(np.mean(solve_times)) if solve_times else 0.0
+    summary["solve_std_s"] = float(np.std(solve_times)) if solve_times else 0.0
 
-    for i, (label, fname) in enumerate(zip(labels, fnames)):
-        plt.figure()
-        plt.plot(time, state_history[:, i])
-        plt.xlabel("Time [s]")
-        plt.ylabel(label)
-        plt.title(label)
-        plt.grid()
-        plt.savefig(os.path.join(OUTPUT_DIR, fname), dpi=150, bbox_inches="tight")
-        plt.close()
-
-    plt.figure()
-    plt.plot(time, action_history[:, 0])
-    plt.xlabel("Time [s]")
-    plt.ylabel("Force [N]")
-    plt.title("MPC Control Force")
-    plt.grid()
-    plt.savefig(os.path.join(OUTPUT_DIR, "mpc_force.png"), dpi=150, bbox_inches="tight")
-    plt.close()
-
-    print(f"Results saved to {OUTPUT_DIR}/")
+    save_results(os.path.join(OUTPUT_DIR, "mpc_metrics.npz"), [summary])
+    print(f"MPC benchmark saved to {OUTPUT_DIR}/mpc_metrics.npz")
+    print(f"  stability_rate={summary.get('stability_rate', 0):.2%}  "
+          f"mean_iters/step={summary['convergence_iters_mean']:.2f}  "
+          f"mean_solve/step={summary['solve_mean_s']*1e3:.1f}ms")
 
 
 def test():
@@ -315,4 +294,5 @@ def test():
 
 
 if __name__ == "__main__":
-    main()
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    benchmark()
